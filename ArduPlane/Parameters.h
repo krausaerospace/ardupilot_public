@@ -570,6 +570,12 @@ public:
     // EFI Engine Monitor
     AP_EFI efi;
 #endif
+
+#if MODE_FOLLOW_ENABLED == ENABLED
+    // follow
+    AP_Follow follow;
+#endif
+
 };
 
 extern const AP_Param::Info var_info[];

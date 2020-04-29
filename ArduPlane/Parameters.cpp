@@ -1248,6 +1248,12 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
     AP_SUBGROUPINFO(efi, "EFI", 22, ParametersG2, AP_EFI),
 #endif
 
+#if MODE_FOLLOW_ENABLED == ENABLED
+    // @Group: FOLL
+    // @Path: ../libraries/AP_Follow/AP_Follow.cpp
+    AP_SUBGROUPINFO(follow, "FOLL", 26, ParametersG2, AP_Follow),
+#endif
+
     AP_GROUPEND
 };
 
