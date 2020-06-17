@@ -63,6 +63,7 @@ import zlib
 import base64
 import time
 import array
+import socket
 import os
 import platform
 import re
@@ -138,6 +139,16 @@ def crc32(bytes, state=0):
         index = (state ^ byte) & 0xff
         state = crctab[index] ^ (state >> 8)
     return state
+
+def set_close_on_exec(fd):
+    '''set the clone on exec flag on a file descriptor. Ignore exceptions'''
+    try:
+        import fcntl
+        flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        flags |= fcntl.FD_CLOEXEC
+        fcntl.fcntl(fd, fcntl.F_SETFD, flags)
+    except Exception:
+        pass
 
 class firmware(object):
     '''Loads a firmware file'''
@@ -224,9 +235,27 @@ class uploader(object):
             source_system = 255
         if source_component is None:
             source_component = 1
+        self.isUDP = False
 
         # open the port, keep the default timeout short so we can poll quickly
-        self.port = serial.Serial(portname, baudrate_bootloader, timeout=1.0)
+        if portname.startswith("udp"):
+            if not portname.startswith('udpout:'):
+                print("%s not supported, use udpout:" % portname)
+                sys.exit(1)
+            a = portname[7:].split(':')
+            if len(a) != 2:
+                print("UDP ports must be specified as host:port")
+                sys.exit(1)
+            self.isUDP = True
+            self.sck = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.destination_addr = (a[0], int(a[1]))
+            set_close_on_exec(self.sck.fileno())
+            self.sck.setblocking(1)
+            self.last_address = None
+            self.resolved_destination_addr = None
+        else:
+            self.port = serial.Serial(portname, baudrate_bootloader, timeout=1.0)
+        
         self.baudrate_bootloader = baudrate_bootloader
         if baudrate_bootloader_flash is not None:
             self.baudrate_bootloader_flash = baudrate_bootloader_flash
@@ -256,11 +285,17 @@ class uploader(object):
             self.MAVLINK_REBOOT_ID0 = None
 
     def close(self):
-        if self.port is not None:
+        if self.isUDP is True:
+            self.sck.close()
+        else:
             self.port.close()
 
     def open(self):
         timeout = time.time() + 0.2
+
+        if self.isUDP is True:
+            #always open...
+            return;
 
         # Attempt to open the port while it exists and until timeout occurs
         while self.port is not None:
@@ -282,16 +317,53 @@ class uploader(object):
 
             else:
                 break
+                
+    def flushInput(self):
+        if self.isUDP is True:
+            '''flush any pending input'''
+            self.buf = ''
+            saved_timeout = self.timeout
+            self.timeout = 0.5
+            self.__recv()
+            self.timeout = saved_timeout
+            self.buf = ''
+        else:
+            self.port.flushInput()
+            
+    def flush(self):
+        if self.isUDP is False:
+            self.port.flush()
 
     def __send(self, c):
-        self.port.write(c)
+        if self.isUDP is True:
+            try:
+                # turn a (possible) hostname into an IP address to
+                # avoid resolving the hostname for every packet sent:
+                if self.destination_addr[0] != self.resolved_destination_addr:
+                    self.resolved_destination_addr = self.destination_addr[0]
+                    self.destination_addr = (socket.gethostbyname(self.destination_addr[0]), self.destination_addr[1])
+                self.sck.sendto(buf, self.destination_addr)
+            except socket.error:
+                pass
+        else:
+            self.port.write(c)
 
     def __recv(self, count=1):
-        c = self.port.read(count)
-        if len(c) < 1:
-            raise RuntimeError("timeout waiting for data (%u bytes)" % count)
-        # print("recv " + binascii.hexlify(c))
-        return c
+        if self.isUDP is True:
+            try:
+                data, new_addr = self.sck.recvfrom(UDP_MAX_PACKET_LEN)
+            except socket.error as e:
+                if e.errno in [ errno.EAGAIN, errno.EWOULDBLOCK, errno.ECONNREFUSED ]:
+                    return ""
+                raise
+            return data
+
+        else:
+            c = self.port.read(count)
+            if len(c) < 1:
+                raise RuntimeError("timeout waiting for data (%u bytes)" % count)
+            # print("recv " + binascii.hexlify(c))
+            return c
 
     def __recv_int(self):
         raw = self.__recv(4)
@@ -299,7 +371,7 @@ class uploader(object):
         return val[0]
 
     def __getSync(self):
-        self.port.flush()
+        self.flush()
         c = bytes(self.__recv())
         if c != self.INSYNC:
             raise RuntimeError("unexpected %s instead of INSYNC" % c)
@@ -316,14 +388,14 @@ class uploader(object):
         # send a stream of ignored bytes longer than the longest possible conversation
         # that we might still have in progress
         # self.__send(uploader.NOP * (uploader.PROG_MULTI_MAX + 2))
-        self.port.flushInput()
+        self.flushInput()
         self.__send(uploader.GET_SYNC +
                     uploader.EOC)
         self.__getSync()
 
     def __trySync(self):
         try:
-            self.port.flush()
+            self.flush()
             if (self.__recv() != self.INSYNC):
                 # print("unexpected 0x%x instead of INSYNC" % ord(c))
                 return False
@@ -442,7 +514,7 @@ class uploader(object):
         self.__send(uploader.READ_MULTI)
         self.__send(length)
         self.__send(uploader.EOC)
-        self.port.flush()
+        self.flush()
         programmed = self.__recv(len(data))
         if programmed != data:
             print("got    " + binascii.hexlify(programmed))
@@ -462,7 +534,7 @@ class uploader(object):
         self.__send(uploader.READ_MULTI)
         self.__send(clength)
         self.__send(uploader.EOC)
-        self.port.flush()
+        self.flush()
         ret = self.__recv(length)
         self.__getSync()
         return ret
@@ -471,7 +543,7 @@ class uploader(object):
     def __reboot(self):
         self.__send(uploader.REBOOT +
                     uploader.EOC)
-        self.port.flush()
+        self.flush()
 
         # v3+ can report failure if the first word flash fails
         if self.bl_rev >= 3:
@@ -754,7 +826,7 @@ class uploader(object):
         if self.fw_maxsize < fw.property('image_size'):
             raise RuntimeError("Firmware image is too large for this board")
 
-        if self.baudrate_bootloader_flash != self.baudrate_bootloader:
+        if self.baudrate_bootloader_flash != self.baudrate_bootloader and self.isUDP is False:
             print("Setting baudrate to %u" % self.baudrate_bootloader_flash)
             self.__setbaud(self.baudrate_bootloader_flash)
             self.port.baudrate = self.baudrate_bootloader_flash
@@ -773,9 +845,12 @@ class uploader(object):
 
         print("\nRebooting.\n")
         self.__reboot()
-        self.port.close()
+        self.close()
 
     def __next_baud_flightstack(self):
+        if self.isUDP is True:
+            return True
+            
         self.baudrate_flightstack_idx = self.baudrate_flightstack_idx + 1
         if self.baudrate_flightstack_idx >= len(self.baudrate_flightstack):
             return False
@@ -791,12 +866,15 @@ class uploader(object):
         if (not self.__next_baud_flightstack()):
             return False
 
-        print("Attempting reboot on %s with baudrate=%d..." % (self.port.port, self.port.baudrate), file=sys.stderr)
-        print("If the board does not respond, unplug and re-plug the USB connector.", file=sys.stderr)
+        if self.isUDP is True:
+            print("Attempting reboot on %s:%s..." % (self.destination_addr[0],self.destination_addr[1]), file=sys.stderr)
+        else:
+            print("Attempting reboot on %s with baudrate=%d..." % (self.port.port, self.port.baudrate), file=sys.stderr)
+            print("If the board does not respond, unplug and re-plug the USB connector.", file=sys.stderr)
 
         try:
             # try MAVLINK command first
-            self.port.flush()
+            self.flush()
             if self.MAVLINK_REBOOT_ID1 is not None:
                 self.__send(self.MAVLINK_REBOOT_ID1)
             if self.MAVLINK_REBOOT_ID0 is not None:
@@ -806,12 +884,14 @@ class uploader(object):
             self.__send(uploader.NSH_REBOOT_BL)
             self.__send(uploader.NSH_INIT)
             self.__send(uploader.NSH_REBOOT)
-            self.port.flush()
-            self.port.baudrate = self.baudrate_bootloader
+            self.flush()
+            if self.isUDP is False:
+                self.port.baudrate = self.baudrate_bootloader
         except Exception:
             try:
-                self.port.flush()
-                self.port.baudrate = self.baudrate_bootloader
+                self.flush()
+                if self.isUDP is False:
+                    self.port.baudrate = self.baudrate_bootloader
             except Exception:
                 pass
 
@@ -819,14 +899,14 @@ class uploader(object):
 
     # upload the firmware
     def download(self, fw):
-        if self.baudrate_bootloader_flash != self.baudrate_bootloader:
+        if self.baudrate_bootloader_flash != self.baudrate_bootloader and self.isUDP is False:
             print("Setting baudrate to %u" % self.baudrate_bootloader_flash)
             self.__setbaud(self.baudrate_bootloader_flash)
             self.port.baudrate = self.baudrate_bootloader_flash
             self.__sync()
 
         self.__download("Download", fw)
-        self.port.close()
+        self.close()
     
 def ports_to_try(args):
     portlist = []
@@ -840,7 +920,10 @@ def ports_to_try(args):
     if "linux" in _platform or "darwin" in _platform or "cygwin" in _platform:
         import glob
         for pattern in patterns:
-            portlist += glob.glob(pattern)
+            if pattern.startswith("udp"):
+                portlist = patterns
+            else:
+                portlist += glob.glob(pattern)
     else:
         portlist = patterns
 
